@@ -1,0 +1,513 @@
+id="wbh1ao"
+import math
+import random
+import numpy as np
+import matplotlib.pyplot as plt
+
+from dataclasses import dataclass
+
+
+# =====================================================
+# CONFIG
+# =====================================================
+
+INITIAL_C0 = 200
+
+ALPHA = 0.3
+
+LAMBDA_1 = 2.0   # использование буфера
+LAMBDA_2 = 5.0   # остатки
+LAMBDA_3 = 8.0   # необслуженные
+LAMBDA_4 = 1.0   # доготовка
+
+MC_SAMPLES = 10
+
+OVERBOOKING_LEVELS = [0.85, 0.90, 0.95, 1.00]
+
+FIXED_COOK = 10
+
+
+# =====================================================
+# DATA
+# =====================================================
+
+TIME_PERIODS = [
+
+    {"period": 0, "meal_type": "meal_1",
+     "groups": "1,2 классы",
+     "benefit_students": 100},
+
+    {"period": 1, "meal_type": "meal_1",
+     "groups": "3,4,5 классы",
+     "benefit_students": 128},
+
+    {"period": 2, "meal_type": "meal_1",
+     "groups": "6-9 классы",
+     "benefit_students": 112},
+
+    {"period": 3, "meal_type": "meal_2",
+     "groups": "1 класс",
+     "benefit_students": 28},
+
+    {"period": 4, "meal_type": "meal_2",
+     "groups": "2-3 классы",
+     "benefit_students": 56},
+
+    {"period": 5, "meal_type": "meal_2",
+     "groups": "4-8 классы",
+     "benefit_students": 112},
+
+    {"period": 6, "meal_type": "meal_2",
+     "groups": "7,9 классы",
+     "benefit_students": 56},
+
+    {"period": 7, "meal_type": "meal_2",
+     "groups": "полный день",
+     "benefit_students": 112},
+]
+
+T = len(TIME_PERIODS)
+
+
+# =====================================================
+# STATE
+# =====================================================
+
+@dataclass(frozen=True)
+class State:
+
+    period: int
+    lambda_p: int
+    buffer: int
+
+
+@dataclass(frozen=True)
+class Action:
+
+    gamma_b: float
+    gamma_p: float
+
+
+# =====================================================
+# ACTION SPACE
+# =====================================================
+
+ALL_ACTIONS = []
+
+for gb in OVERBOOKING_LEVELS:
+    for gp in OVERBOOKING_LEVELS:
+
+        ALL_ACTIONS.append(
+            Action(
+                gamma_b=gb,
+                gamma_p=gp
+            )
+        )
+
+
+# =====================================================
+# DEMAND
+# =====================================================
+
+def sample_absences(b_i):
+
+    d_max = max(1, int(0.15 * b_i))
+
+    weights = [
+        (d_max - d + 1) ** 2
+        for d in range(d_max + 1)
+    ]
+
+    return random.choices(
+        list(range(d_max + 1)),
+        weights=weights,
+        k=1
+    )[0]
+
+
+def poisson_sample(lmbd):
+
+    L = math.exp(-lmbd)
+
+    k = 0
+    p = 1
+
+    while p > L:
+
+        k += 1
+        p *= random.random()
+
+    return k - 1
+
+
+def sample_paid(lambda_i):
+
+    return poisson_sample(lambda_i)
+
+
+def update_lambda(previous_lambda, actual_paid):
+
+    new_lambda = (
+        ALPHA * actual_paid
+        + (1 - ALPHA) * previous_lambda
+    )
+
+    return round(new_lambda)
+
+
+# =====================================================
+# TRANSITION
+# =====================================================
+
+def transition(state, action):
+
+    current_data = TIME_PERIODS[state.period]
+
+    b = current_data["benefit_students"]
+
+    prep_b = round(b * action.gamma_b)
+
+    prep_p = round(state.lambda_p * action.gamma_p)
+
+    planned = prep_b + prep_p
+
+    d = sample_absences(b)
+
+    w = sample_paid(state.lambda_p)
+
+    actual_benefit = b - d
+
+    actual = actual_benefit + w
+
+    available = (
+        planned
+        + state.buffer
+        + FIXED_COOK
+    )
+
+    served = min(actual, available)
+
+    unserved = max(0, actual - available)
+
+    used_buffer = min(
+        state.buffer,
+        max(0, actual - planned)
+    )
+
+    leftovers = max(0, available - actual)
+
+    next_period = min(
+        state.period + 1,
+        T - 1
+    )
+
+    next_lambda = update_lambda(
+        state.lambda_p,
+        w
+    )
+
+    next_buffer = min(
+        80,
+        leftovers
+    )
+
+    next_state = State(
+        period=next_period,
+        lambda_p=next_lambda,
+        buffer=next_buffer
+    )
+
+    cost = (
+        LAMBDA_1 * used_buffer
+        + LAMBDA_2 * leftovers
+        + LAMBDA_3 * (unserved ** 2)
+        + LAMBDA_4 * FIXED_COOK
+    )
+
+    info = {
+
+        "planned": planned,
+        "actual": actual,
+        "served": served,
+        "unserved": unserved,
+        "leftovers": leftovers,
+        "used_buffer": used_buffer,
+        "cost": cost,
+        "gamma_b": action.gamma_b,
+        "gamma_p": action.gamma_p,
+    }
+
+    return next_state, cost, info
+
+
+# =====================================================
+# STATE SPACE
+# =====================================================
+
+ALL_STATES = []
+
+for period in range(T):
+
+    for lambda_p in range(0, 41, 5):
+
+        for buffer in range(0, 81, 10):
+
+            ALL_STATES.append(
+                State(
+                    period=period,
+                    lambda_p=lambda_p,
+                    buffer=buffer
+                )
+            )
+
+
+# =====================================================
+# BELLMAN TABLES
+# =====================================================
+
+V = {}
+POLICY = {}
+
+
+# =====================================================
+# FINITE HORIZON BELLMAN
+# =====================================================
+
+def solve_bellman():
+
+    # terminal values
+
+    for state in ALL_STATES:
+
+        V[(T, state)] = 0
+
+    # backward induction
+
+    for t in reversed(range(T)):
+
+        print(f"Solving period {t}")
+
+        current_states = [
+            s for s in ALL_STATES
+            if s.period == t
+        ]
+
+        for state in current_states:
+
+            best_value = float("inf")
+
+            best_action = None
+
+            for action in ALL_ACTIONS:
+
+                total = 0
+
+                for _ in range(MC_SAMPLES):
+
+                    next_state, cost, _ = transition(
+                        state,
+                        action
+                    )
+
+                    if t == T - 1:
+
+                        future = 0
+
+                    else:
+
+                        future = V.get(
+                            (t + 1, next_state),
+                            0
+                        )
+
+                    total += (
+                        cost + future
+                    )
+
+                expected = total / MC_SAMPLES
+
+                if expected < best_value:
+
+                    best_value = expected
+
+                    best_action = action
+
+            V[(t, state)] = best_value
+
+            POLICY[(t, state)] = best_action
+
+
+# =====================================================
+# POLICY
+# =====================================================
+
+def get_action(state):
+
+    approx_state = State(
+        period=state.period,
+        lambda_p=5 * round(state.lambda_p / 5),
+        buffer=10 * round(state.buffer / 10)
+    )
+
+    return POLICY.get(
+        (state.period, approx_state),
+        Action(1.0, 1.0)
+    )
+
+
+# =====================================================
+# SIMULATION
+# =====================================================
+
+def simulate_week():
+
+    results = []
+
+    state = State(
+        period=0,
+        lambda_p=20,
+        buffer=20
+    )
+
+    cumulative_cost = 0
+
+    for day in range(5):
+
+        print("=" * 60)
+        print(f"DAY {day+1}")
+        print("=" * 60)
+
+        for period in range(T):
+
+            action = get_action(state)
+
+            next_state, cost, info = transition(
+                state,
+                action
+            )
+
+            cumulative_cost += cost
+
+            result = {
+
+                "day": day + 1,
+                "period": period,
+                "planned": info["planned"],
+                "actual": info["actual"],
+                "served": info["served"],
+                "unserved": info["unserved"],
+                "leftovers": info["leftovers"],
+                "cost": cost,
+                "gamma_b": info["gamma_b"],
+                "gamma_p": info["gamma_p"],
+                "buffer": state.buffer,
+                "lambda_p": state.lambda_p,
+                "cumulative_cost": cumulative_cost
+            }
+
+            results.append(result)
+
+            print(
+                f"P{period} | "
+                f"plan={info['planned']} | "
+                f"actual={info['actual']} | "
+                f"unserved={info['unserved']} | "
+                f"leftovers={info['leftovers']} | "
+                f"γb={info['gamma_b']} | "
+                f"γp={info['gamma_p']} | "
+                f"cost={cost:.2f}"
+            )
+
+            state = next_state
+
+        state = State(
+            period=0,
+            lambda_p=state.lambda_p,
+            buffer=20
+        )
+
+    return results
+
+
+# =====================================================
+# PLOTS
+# =====================================================
+
+def plot_results(results):
+
+    days = sorted(
+        list(set(r["day"] for r in results))
+    )
+
+    daily_costs = []
+
+    for day in days:
+
+        total = sum(
+            r["cost"]
+            for r in results
+            if r["day"] == day
+        )
+
+        daily_costs.append(total)
+
+    plt.figure(figsize=(10, 5))
+
+    plt.plot(
+        days,
+        daily_costs,
+        marker='o'
+    )
+
+    plt.xlabel("День")
+
+    plt.ylabel("Штраф")
+
+    plt.title(
+        "Штрафы по дням"
+    )
+
+    plt.grid(True)
+
+    plt.show()
+
+
+# =====================================================
+# MAIN
+# =====================================================
+
+def main():
+
+    random.seed(42)
+
+    print("=" * 60)
+    print("FINITE HORIZON BELLMAN")
+    print("=" * 60)
+
+    solve_bellman()
+
+    print("=" * 60)
+    print("SIMULATION")
+    print("=" * 60)
+
+    results = simulate_week()
+
+    total_cost = sum(
+        r["cost"]
+        for r in results
+    )
+
+    print("\n" + "=" * 60)
+
+    print(
+        f"TOTAL COST: {total_cost:.2f}"
+    )
+
+    print("=" * 60)
+
+    plot_results(results)
+
+
+if __name__ == "__main__":
+
+    main()
